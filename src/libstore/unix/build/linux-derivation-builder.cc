@@ -235,6 +235,55 @@ struct FsIdsScope
     }
 };
 
+/**
+ * Creates the mount point for a bind of `source` at `rel` below the
+ * directory `dirFd`, as `uid`:`gid`: a directory for a directory, a copy
+ * for a symlink (which cannot be bind-mounted), an empty file otherwise.
+ * Only the creation runs under those ids, relative to a directory the
+ * caller opened, so the path above it is still walked with the caller's.
+ * Returns whether `source` still needs bind-mounting there.
+ */
+static bool createBindTargetAs(
+    int dirFd,
+    const std::filesystem::path & rel,
+    const std::filesystem::path & source,
+    const struct stat & st,
+    uid_t uid,
+    gid_t gid)
+{
+    auto linkTarget = S_ISLNK(st.st_mode) ? std::optional{readLink(source)} : std::nullopt;
+
+    FsIdsScope asOwner(uid, gid);
+
+    AutoCloseFD parent{dup(dirFd)};
+    if (!parent)
+        throw SysError("duplicating a directory descriptor");
+    auto leaf = rel.filename();
+    for (auto & component : rel.parent_path()) {
+        if (mkdirat(parent.get(), component.c_str(), 0755) == -1 && errno != EEXIST)
+            throw SysError("creating directory %1%", PathFmt(component));
+        AutoCloseFD next{openat(parent.get(), component.c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC)};
+        if (!next)
+            throw SysError("opening directory %1%", PathFmt(component));
+        parent = std::move(next);
+    }
+
+    if (S_ISDIR(st.st_mode)) {
+        if (mkdirat(parent.get(), leaf.c_str(), 0755) == -1 && errno != EEXIST)
+            throw SysError("creating directory %1%", PathFmt(rel));
+        return true;
+    }
+    if (linkTarget) {
+        if (symlinkat(linkTarget->c_str(), parent.get(), leaf.c_str()) == -1)
+            throw SysError("creating symlink %1%", PathFmt(rel));
+        return false;
+    }
+    AutoCloseFD file{openat(parent.get(), leaf.c_str(), O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0644)};
+    if (!file)
+        throw SysError("creating file %1%", PathFmt(rel));
+    return true;
+}
+
 static void doBind(const std::filesystem::path & source, const std::filesystem::path & target, bool optional = false)
 {
     debug("bind mounting %1% to %2%", PathFmt(source), PathFmt(target));
@@ -758,11 +807,31 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
                 if (!hostDev && usingUserNamespace && isInDir(i.first, "/dev/shm")) {
                     /* The /dev/shm tmpfs belongs to the sandbox's user
                        namespace, where the host root running this setup
-                       has no uid, so the kernel refuses to create the bind
-                       target there with EOVERFLOW. Create it as the
-                       sandbox user, who is mapped. */
-                    FsIdsScope asSandboxUser(sandboxUid(), sandboxGid());
-                    doBind(i.second.source, target, i.second.optional);
+                       has no uid, so the kernel refuses to create a mount
+                       point on it with EOVERFLOW. The sandbox user, who is
+                       mapped, creates it. */
+                    auto st = maybeLstat(i.second.source);
+                    if (!st) {
+                        if (i.second.optional)
+                            continue;
+                        throw SysError("getting attributes of path %1%", PathFmt(i.second.source));
+                    }
+                    auto shm = chrootRootDir / "dev" / "shm";
+                    AutoCloseFD shmFd{open(shm.c_str(), O_DIRECTORY | O_RDONLY | O_CLOEXEC)};
+                    if (!shmFd)
+                        throw SysError("opening %1%", PathFmt(shm));
+                    if (createBindTargetAs(
+                            shmFd.get(),
+                            i.first.lexically_relative("/dev/shm"),
+                            i.second.source,
+                            *st,
+                            sandboxUid(),
+                            sandboxGid())) {
+                        debug("bind mounting %1% to %2%", PathFmt(i.second.source), PathFmt(target));
+                        if (mount(i.second.source.c_str(), target.c_str(), "", MS_BIND | MS_REC, 0) == -1)
+                            throw SysError(
+                                "bind mount from %1% to %2% failed", PathFmt(i.second.source), PathFmt(target));
+                    }
                 } else
                     doBind(i.second.source, target, i.second.optional);
             }
