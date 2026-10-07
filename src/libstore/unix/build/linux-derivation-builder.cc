@@ -686,6 +686,27 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             pathsInChroot.emplace(i, canonicalPath);
         }
 
+        /* Mount a new tmpfs on /dev/shm to ensure that whatever
+           the builder puts in /dev/shm is cleaned up automatically.
+           With the nearly empty /dev this happens before the bind mounts
+           below, so that a path in `sandbox-paths` under /dev/shm (such
+           as a POSIX semaphore) lands on the tmpfs instead of being
+           hidden by it; a bind-mounted host /dev gets it after. */
+        auto mountShm = [&]() {
+            if (pathExists("/dev/shm")
+                && mount(
+                       "none",
+                       (chrootRootDir / "dev" / "shm").c_str(),
+                       "tmpfs",
+                       0,
+                       fmt("size=%s", store.config->getLocalSettings().sandboxShmSize).c_str())
+                       == -1)
+                throw SysError("mounting /dev/shm");
+        };
+        bool hostDev = pathsInChroot.find("/dev") != pathsInChroot.end();
+        if (!hostDev)
+            mountShm();
+
         /* Bind-mount all the directories from the "host"
            filesystem that we want in the chroot
            environment. */
@@ -721,17 +742,8 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
                 throw SysError("mounting /sys");
         }
 
-        /* Mount a new tmpfs on /dev/shm to ensure that whatever
-           the builder puts in /dev/shm is cleaned up automatically. */
-        if (pathExists("/dev/shm")
-            && mount(
-                   "none",
-                   (chrootRootDir / "dev" / "shm").c_str(),
-                   "tmpfs",
-                   0,
-                   fmt("size=%s", store.config->getLocalSettings().sandboxShmSize).c_str())
-                   == -1)
-            throw SysError("mounting /dev/shm");
+        if (hostDev)
+            mountShm();
 
         /* Mount a new devpts on /dev/pts.  Note that this
            requires the kernel to be compiled with
