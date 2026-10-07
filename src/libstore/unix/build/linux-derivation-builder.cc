@@ -24,6 +24,7 @@
 #  include <sys/mount.h>
 #  include <sys/syscall.h>
 #  include <sys/prctl.h>
+#  include <sys/fsuid.h>
 
 #  if HAVE_SECCOMP
 #    include <seccomp.h>
@@ -206,6 +207,33 @@ static void setupLandlock()
 #    define DO_LANDLOCK 0
 
 #  endif
+
+/**
+ * Switches this thread's filesystem uid and gid for the lifetime of the
+ * scope, restoring the previous ones on exit.
+ */
+struct FsIdsScope
+{
+    uid_t prevUid;
+    gid_t prevGid;
+
+    FsIdsScope(uid_t uid, gid_t gid)
+    {
+        prevGid = setfsgid(gid);
+        prevUid = setfsuid(uid);
+        if ((uid_t) setfsuid(-1) != uid || (gid_t) setfsgid(-1) != gid) {
+            setfsuid(prevUid);
+            setfsgid(prevGid);
+            throw Error("cannot switch the filesystem ids to %d:%d", uid, gid);
+        }
+    }
+
+    ~FsIdsScope()
+    {
+        setfsuid(prevUid);
+        setfsgid(prevGid);
+    }
+};
 
 static void doBind(const std::filesystem::path & source, const std::filesystem::path & target, bool optional = false)
 {
@@ -726,7 +754,17 @@ struct ChrootLinuxDerivationBuilder : ChrootDerivationBuilder, LinuxDerivationBu
             } else
 #  endif
             {
-                doBind(i.second.source, chrootRootDir / i.first.relative_path(), i.second.optional);
+                auto target = chrootRootDir / i.first.relative_path();
+                if (!hostDev && usingUserNamespace && isInDir(i.first, "/dev/shm")) {
+                    /* The /dev/shm tmpfs belongs to the sandbox's user
+                       namespace, where the host root running this setup
+                       has no uid, so the kernel refuses to create the bind
+                       target there with EOVERFLOW. Create it as the
+                       sandbox user, who is mapped. */
+                    FsIdsScope asSandboxUser(sandboxUid(), sandboxGid());
+                    doBind(i.second.source, target, i.second.optional);
+                } else
+                    doBind(i.second.source, target, i.second.optional);
             }
         }
 
