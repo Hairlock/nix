@@ -209,79 +209,66 @@ static void setupLandlock()
 #  endif
 
 /**
- * Switches this thread's filesystem uid and gid for the lifetime of the
- * scope, restoring the previous ones on exit.
- */
-struct FsIdsScope
-{
-    uid_t prevUid;
-    gid_t prevGid;
-
-    FsIdsScope(uid_t uid, gid_t gid)
-    {
-        prevGid = setfsgid(gid);
-        prevUid = setfsuid(uid);
-        if ((uid_t) setfsuid(-1) != uid || (gid_t) setfsgid(-1) != gid) {
-            setfsuid(prevUid);
-            setfsgid(prevGid);
-            throw Error("cannot switch the filesystem ids to %d:%d", uid, gid);
-        }
-    }
-
-    ~FsIdsScope()
-    {
-        setfsuid(prevUid);
-        setfsgid(prevGid);
-    }
-};
-
-/**
  * Creates the mount point for a bind of `source` at `rel` below the
  * directory `dirFd`, as `uid`:`gid`: a directory for a directory, a copy
  * for a symlink (which cannot be bind-mounted), an empty file otherwise.
- * Only the creation runs under those ids, relative to a directory the
- * caller opened, so the path above it is still walked with the caller's.
- * Returns whether `source` still needs bind-mounting there.
+ * A child process takes those filesystem ids and creates it relative to
+ * the directory the caller opened, so the caller walks every path with
+ * its own ids; it could not take them back itself when they have no uid
+ * in its user namespace. Returns whether `source` still needs
+ * bind-mounting there.
  */
 static bool createBindTargetAs(
     int dirFd,
     const std::filesystem::path & rel,
     const std::filesystem::path & source,
-    const struct stat & st,
+    const PosixStat & st,
     uid_t uid,
     gid_t gid)
 {
     auto linkTarget = S_ISLNK(st.st_mode) ? std::optional{readLink(source)} : std::nullopt;
 
-    FsIdsScope asOwner(uid, gid);
+    Pid child = startProcess(
+        [&]() {
+            setfsgid(gid);
+            setfsuid(uid);
+            if ((uid_t) setfsuid(-1) != uid || (gid_t) setfsgid(-1) != gid)
+                throw Error("cannot switch the filesystem ids to %d:%d", uid, gid);
 
-    AutoCloseFD parent{dup(dirFd)};
-    if (!parent)
-        throw SysError("duplicating a directory descriptor");
-    auto leaf = rel.filename();
-    for (auto & component : rel.parent_path()) {
-        if (mkdirat(parent.get(), component.c_str(), 0755) == -1 && errno != EEXIST)
-            throw SysError("creating directory %1%", PathFmt(component));
-        AutoCloseFD next{openat(parent.get(), component.c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC)};
-        if (!next)
-            throw SysError("opening directory %1%", PathFmt(component));
-        parent = std::move(next);
-    }
+            AutoCloseFD parent{dup(dirFd)};
+            if (!parent)
+                throw SysError("duplicating a directory descriptor");
+            for (auto & component : rel.parent_path()) {
+                if (mkdirat(parent.get(), component.c_str(), 0755) == -1 && errno != EEXIST)
+                    throw SysError("creating directory %1%", PathFmt(component));
+                AutoCloseFD next{
+                    openat(parent.get(), component.c_str(), O_DIRECTORY | O_NOFOLLOW | O_RDONLY | O_CLOEXEC)};
+                if (!next)
+                    throw SysError("opening directory %1%", PathFmt(component));
+                parent = std::move(next);
+            }
 
-    if (S_ISDIR(st.st_mode)) {
-        if (mkdirat(parent.get(), leaf.c_str(), 0755) == -1 && errno != EEXIST)
-            throw SysError("creating directory %1%", PathFmt(rel));
-        return true;
-    }
-    if (linkTarget) {
-        if (symlinkat(linkTarget->c_str(), parent.get(), leaf.c_str()) == -1)
-            throw SysError("creating symlink %1%", PathFmt(rel));
-        return false;
-    }
-    AutoCloseFD file{openat(parent.get(), leaf.c_str(), O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0644)};
-    if (!file)
-        throw SysError("creating file %1%", PathFmt(rel));
-    return true;
+            auto leaf = rel.filename();
+            if (S_ISDIR(st.st_mode)) {
+                if (mkdirat(parent.get(), leaf.c_str(), 0755) == -1 && errno != EEXIST)
+                    throw SysError("creating directory %1%", PathFmt(rel));
+            } else if (linkTarget) {
+                if (symlinkat(linkTarget->c_str(), parent.get(), leaf.c_str()) == -1)
+                    throw SysError("creating symlink %1%", PathFmt(rel));
+            } else {
+                AutoCloseFD file{
+                    openat(parent.get(), leaf.c_str(), O_CREAT | O_WRONLY | O_NOFOLLOW | O_CLOEXEC, 0644)};
+                if (!file)
+                    throw SysError("creating file %1%", PathFmt(rel));
+            }
+            _exit(0);
+        },
+        {.errorPrefix = "creating a sandbox mount point: "});
+
+    if (int status = child.wait(); !statusOk(status))
+        throw Error("creating the mount point %1% in the sandbox %2%", PathFmt(rel), statusToString(status));
+
+    return !linkTarget;
 }
 
 static void doBind(const std::filesystem::path & source, const std::filesystem::path & target, bool optional = false)
